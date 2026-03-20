@@ -97,6 +97,18 @@
             cargo-watch
             jq
           ];
+
+          shellHook =
+            pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+              export PATH="${pkgs.fuse}/bin:$PATH"
+              export LD_LIBRARY_PATH="${pkgs.fuse}/lib''${LD_LIBRARY_PATH+:$LD_LIBRARY_PATH}"
+              export PKG_CONFIG_PATH="${pkgs.fuse}/lib/pkgconfig''${PKG_CONFIG_PATH+:$PKG_CONFIG_PATH}"
+            ''
+            + pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+              # macfuse-stubs is for build only; runtime needs macFUSE or FUSE-T installed system-wide
+              # Install via: brew install --cask macfuse  OR  brew install fuse-t
+              export DYLD_LIBRARY_PATH="/usr/local/lib''${DYLD_LIBRARY_PATH+:$DYLD_LIBRARY_PATH}"
+            '';
         };
       }
     );

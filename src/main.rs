@@ -2,7 +2,7 @@ mod config;
 mod error;
 mod storage;
 
-use std::{io::stdout, path::PathBuf};
+use std::io::stdout;
 
 use clap::{Parser, Subcommand};
 use tracing::{debug, error, info, warn};
@@ -11,9 +11,9 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 use config::DataPaths;
 use error::SuperfuseError;
-use storage::FileMapping;
+use storage::{FileMapping, SqlitePool};
 
-use crate::config::{SuperpositionConfig, init_superposition_provider};
+use crate::config::{SuperpositionConfig, fs_config, init_superposition_provider};
 
 #[derive(Parser, Debug)]
 #[command(name = "superfuse", about = "Virtual filesystem for templated configs")]
@@ -26,20 +26,20 @@ struct Cli {
 enum Commands {
     /// Start the superfuse filesystem
     Start {
-        mount_point: PathBuf,
+        mount_point: String,
         /// Automatically unmount on process exit
-        #[clap(long)]
+        #[arg(short = 'u', long, default_value_t = true)]
         auto_unmount: bool,
         /// Allow root user to access filesystem
-        #[clap(long)]
+        #[arg(short, long, default_value_t = true)]
         allow_root: bool,
         /// Number of threads to use
-        #[clap(long, default_value_t = 1)]
+        #[arg(short, long, default_value_t = 4)]
         n_threads: usize,
         /// Use `FUSE_DEV_IOC_CLONE` to give each worker thread its own fd.
         /// This enables more efficient request processing
         /// when multiple threads are used. Requires Linux 4.5+.
-        #[clap(long)]
+        #[arg(short, long, default_value_t = true)]
         clone_fd: bool,
     },
     /// Add a new file mapping
@@ -114,7 +114,7 @@ fn print_mappings(mappings: &[FileMapping]) {
             m.id,
             truncate(&m.virtual_path, 40),
             truncate(&m.template_path, 40),
-            truncate(&m.updated_at, 20)
+            truncate(&m.last_modified_at, 20)
         );
     }
 }
@@ -146,9 +146,8 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Initialize database
+    // Initialize database pool (using r2d2_sqlite for thread safety)
     let Ok(pool) = storage::init_db(&data_paths.db)
-        .await
         .map_err(|e| error!(error = %e, "failed to initialize database"))
     else {
         std::process::exit(1);
@@ -166,20 +165,70 @@ async fn main() {
 
 async fn handle_command(
     cli: Cli,
-    pool: sqlx::SqlitePool,
+    pool: SqlitePool,
     paths: &DataPaths,
 ) -> Result<(), SuperfuseError> {
     match cli.command {
-        Commands::Start { .. } => {
+        Commands::Start {
+            mount_point,
+            auto_unmount,
+            allow_root,
+            n_threads,
+            clone_fd,
+        } => {
+            // Initialize superposition provider
             let config = SuperpositionConfig::init()?;
             let provider = init_superposition_provider(&config).await?;
+
+            // Create the FUSE filesystem with the connection pool
+            let fs = storage::SuperfuseFileSystem::new(pool, paths.clone(), provider);
+
+            // Mount the filesystem using spawn_mount2 so we can handle signals
+            info!(mount_point = %mount_point, "mounting filesystem");
+            let fs_config = fs_config(&mount_point, auto_unmount, allow_root, n_threads, clone_fd);
+            let session = fuser::spawn_mount2(fs, &mount_point, &fs_config).map_err(|e| {
+                error!(error = %e, "failed to mount filesystem");
+                SuperfuseError::Io(e)
+            })?;
+
+            info!("filesystem mounted, waiting for shutdown signal");
+
+            // Wait for SIGINT (Ctrl+C), SIGTERM, or SIGHUP
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .map_err(|e| SuperfuseError::Io(e))?;
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .map_err(|e| SuperfuseError::Io(e))?;
+            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .map_err(|e| SuperfuseError::Io(e))?;
+
+            tokio::select! {
+                _ = sigint.recv() => info!("received SIGINT"),
+                _ = sigterm.recv() => info!("received SIGTERM"),
+                _ = sighup.recv() => info!("received SIGHUP"),
+            }
+
+            // Cleanly unmount and join the background thread
+            info!(mount_point = %mount_point, "unmounting filesystem");
+            session.umount_and_join().map_err(|e| {
+                error!(error = %e, "failed to unmount filesystem");
+                SuperfuseError::Io(e)
+            })?;
+            info!("filesystem unmounted successfully");
         }
         Commands::Add { path, template } => {
             validate_template_exists(&template)?;
             let canonical = std::fs::canonicalize(&template).map_err(SuperfuseError::Io)?;
             let template_path = canonical.display().to_string();
 
-            let mapping = storage::add_mapping(&pool, &path, &template_path).await?;
+            // Get a connection from the pool for this CLI operation
+            let conn = pool.get().map_err(|e| {
+                error!(error = %e, "failed to get connection from pool");
+                SuperfuseError::Database(rusqlite::Error::InvalidQuery)
+            })?;
+
+            let mapping = storage::add_mapping(&conn, &path, &template_path)?;
             info!(id = mapping.id, path = %mapping.virtual_path, "mapping added");
             println!(
                 "Added mapping: {} -> {}",
@@ -187,7 +236,12 @@ async fn handle_command(
             );
         }
         Commands::Remove { ref path } => {
-            storage::remove_mapping(&pool, path).await?;
+            let conn = pool.get().map_err(|e| {
+                error!(error = %e, "failed to get connection from pool");
+                SuperfuseError::Database(rusqlite::Error::InvalidQuery)
+            })?;
+
+            storage::remove_mapping(&conn, path)?;
             println!("Removed mapping: {}", path);
         }
         Commands::Update { ref path, template } => {
@@ -195,14 +249,24 @@ async fn handle_command(
             let canonical = std::fs::canonicalize(&template).map_err(SuperfuseError::Io)?;
             let template_path = canonical.display().to_string();
 
-            let mapping = storage::update_mapping(&pool, path, &template_path).await?;
+            let conn = pool.get().map_err(|e| {
+                error!(error = %e, "failed to get connection from pool");
+                SuperfuseError::Database(rusqlite::Error::InvalidQuery)
+            })?;
+
+            let mapping = storage::update_mapping(&conn, path, &template_path)?;
             println!(
                 "Updated mapping: {} -> {}",
                 mapping.virtual_path, mapping.template_path
             );
         }
         Commands::List => {
-            let mappings = storage::list_mappings(&pool).await?;
+            let conn = pool.get().map_err(|e| {
+                error!(error = %e, "failed to get connection from pool");
+                SuperfuseError::Database(rusqlite::Error::InvalidQuery)
+            })?;
+
+            let mappings = storage::list_mappings(&conn)?;
             print_mappings(&mappings);
         }
     }

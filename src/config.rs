@@ -6,6 +6,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
+use fuser::SessionACL;
 use superposition_provider::{SuperpositionProvider, SuperpositionProviderOptions};
 use tracing::{debug, info, warn};
 
@@ -111,6 +112,7 @@ pub async fn init_superposition_provider(
             size: Some(require_env("SUPERPOSITION_CACHE_SIZE", 500)),
             ttl: Some(require_env("SUPERPOSITION_CACHE_TTL", 3600)),
         }),
+        // evaluation_cache: None,
         refresh_strategy: superposition_provider::RefreshStrategy::Polling(
             superposition_provider::PollingStrategy {
                 interval: require_env("SUPERPOSITION_POLL_FREQUENCY", 60),
@@ -120,5 +122,39 @@ pub async fn init_superposition_provider(
         experimentation_options: None,
     };
     let provider = SuperpositionProvider::new(options);
+    provider
+        .init()
+        .await
+        .map_err(|e| SuperfuseError::Provider(e.to_string()))?;
     Ok(provider)
+}
+
+pub fn fs_config(
+    mount_point: &str,
+    auto_unmount: bool,
+    allow_root: bool,
+    n_threads: usize,
+    clone_fd: bool,
+) -> fuser::Config {
+    let mut config = fuser::Config::default();
+    if auto_unmount {
+        config.mount_options.push(fuser::MountOption::AutoUnmount);
+    }
+    if allow_root {
+        config.acl = SessionACL::RootAndOwner;
+    }
+    if config
+        .mount_options
+        .contains(&fuser::MountOption::AutoUnmount)
+        && config.acl != SessionACL::RootAndOwner
+    {
+        config.acl = SessionACL::All;
+    }
+    config.n_threads = Some(n_threads);
+    config.clone_fd = clone_fd;
+    config.mount_options.extend([
+        fuser::MountOption::RO,
+        fuser::MountOption::FSName(mount_point.to_string()),
+    ]);
+    config
 }

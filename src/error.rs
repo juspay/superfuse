@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SuperfuseError {
-
     #[error("could not determine data directory for superfuse")]
     NoDataDir,
 
@@ -11,9 +10,13 @@ pub enum SuperfuseError {
         path: PathBuf,
         source: std::io::Error,
     },
+    
 
     #[error("database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(#[from] rusqlite::Error),
+
+    #[error("pool error: {0}")]
+    Pool(#[from] r2d2::Error),
 
     #[error("mapping not found for path: {0}")]
     MappingNotFound(String),
@@ -29,7 +32,7 @@ pub enum SuperfuseError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-
-    // #[error("superposition provider error: {0}")]
-    // Provider(String),
+    
+    #[error("superposition provider error: {0}")]
+    Provider(String),
 }

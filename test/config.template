@@ -1,0 +1,4 @@
+{
+  "per_km_rate": 1,
+  "payment_method": "{{ payment_method }}"
+}
